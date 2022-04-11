@@ -17,7 +17,7 @@ exchangeStrategies:
         USDT: 15%
         TWD: 15%
       threshold: 2%
-      # max amount to buy or sell per order
-      maxAmount: 10_000
+      sliceSize: 0.1
+      updateInterval: 10s
       verbose: true
       dryRun: false

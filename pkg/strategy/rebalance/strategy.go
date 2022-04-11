@@ -4,7 +4,12 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"os/signal"
 	"sort"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -12,6 +17,16 @@ import (
 	"github.com/c9s/bbgo/pkg/fixedpoint"
 	"github.com/c9s/bbgo/pkg/types"
 )
+
+type TargetOrder struct {
+	Symbol   string
+	Side     types.SideType
+	Quantity fixedpoint.Value
+}
+
+func (o TargetOrder) String() string {
+	return fmt.Sprintf("TargetOrder{symbol=%v, side=%v, quantity=%v}", o.Symbol, o.Side, o.Quantity)
+}
 
 const ID = "rebalance"
 
@@ -24,15 +39,15 @@ func init() {
 type Strategy struct {
 	Notifiability *bbgo.Notifiability
 
-	Interval      types.Interval              `json:"interval"`
-	BaseCurrency  string                      `json:"baseCurrency"`
-	TargetWeights map[string]fixedpoint.Value `json:"targetWeights"`
-	Threshold     fixedpoint.Value            `json:"threshold"`
-	IgnoreLocked  bool                        `json:"ignoreLocked"`
-	Verbose       bool                        `json:"verbose"`
-	DryRun        bool                        `json:"dryRun"`
-	// max amount to buy or sell per order
-	MaxAmount fixedpoint.Value `json:"maxAmount"`
+	Interval       types.Interval              `json:"interval"`
+	BaseCurrency   string                      `json:"baseCurrency"`
+	TargetWeights  map[string]fixedpoint.Value `json:"targetWeights"`
+	Threshold      fixedpoint.Value            `json:"threshold"`
+	IgnoreLocked   bool                        `json:"ignoreLocked"`
+	Verbose        bool                        `json:"verbose"`
+	DryRun         bool                        `json:"dryRun"`
+	SliceSize      fixedpoint.Value            `json:"sliceSize"`
+	UpdateInterval UpdateInterval              `json:"updateInterval"`
 
 	currencies []string
 }
@@ -65,10 +80,6 @@ func (s *Strategy) Validate() error {
 		return fmt.Errorf("threshold should not less than 0")
 	}
 
-	if s.MaxAmount.Sign() < 0 {
-		return fmt.Errorf("maxAmount shoud not less than 0")
-	}
-
 	return nil
 }
 
@@ -79,6 +90,7 @@ func (s *Strategy) Subscribe(session *bbgo.ExchangeSession) {
 }
 
 func (s *Strategy) Run(ctx context.Context, orderExecutor bbgo.OrderExecutor, session *bbgo.ExchangeSession) error {
+	log.Infof("update interval: %v", s.UpdateInterval)
 	session.MarketDataStream.OnKLineClosed(func(kline types.KLine) {
 		s.rebalance(ctx, orderExecutor, session)
 	})
@@ -95,19 +107,64 @@ func (s *Strategy) rebalance(ctx context.Context, orderExecutor bbgo.OrderExecut
 	quantities := s.getQuantities(balances)
 	marketValues := prices.Mul(quantities)
 
-	orders := s.generateSubmitOrders(prices, marketValues)
-	for _, order := range orders {
-		log.Infof("generated submit order: %s", order.String())
+	targetOrders := s.generateTargetOrders(prices, marketValues)
+	for _, order := range targetOrders {
+		log.Infof("generated target order: %s", order.String())
 	}
 
 	if s.DryRun {
 		return
 	}
 
-	_, err = orderExecutor.SubmitOrders(ctx, orders...)
-	if err != nil {
-		log.WithError(err).Error("submit order error")
+	s.executeTargetOrders(targetOrders, session, ctx)
+}
+
+func (s *Strategy) executeTargetOrders(targetOrders []TargetOrder, session *bbgo.ExchangeSession, ctx context.Context) {
+	weightGroup := new(sync.WaitGroup)
+	weightGroup.Add(len(targetOrders))
+	for _, o := range targetOrders {
+		go s.executeTwap(session, o, ctx, weightGroup)
+	}
+	weightGroup.Wait()
+}
+
+func (s *Strategy) executeTwap(session *bbgo.ExchangeSession, o TargetOrder, ctx context.Context, waitGroup *sync.WaitGroup) {
+	defer waitGroup.Done()
+
+	sliceQuantity := o.Quantity.Mul(s.SliceSize)
+	execution := &bbgo.TwapExecution{
+		Session:        session,
+		Symbol:         o.Symbol,
+		Side:           o.Side,
+		TargetQuantity: o.Quantity,
+		SliceQuantity:  sliceQuantity,
+		UpdateInterval: time.Duration(s.UpdateInterval),
+	}
+	log.Infof("twap execution, symbol: %v, target quantity: %v, slice quantity: %v", o.Symbol, o.Quantity.Float64(), sliceQuantity.Float64())
+
+	executionCtx, cancelExecution := context.WithCancel(ctx)
+	defer cancelExecution()
+	if err := execution.Run(executionCtx); err != nil {
+		log.WithError(err)
 		return
+	}
+
+	var sigC = make(chan os.Signal, 1)
+	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigC)
+
+	select {
+	case sig := <-sigC:
+		log.Warnf("signal %v", sig)
+		log.Infof("shutting down order executor...")
+		shutdownCtx, cancelShutdown := context.WithDeadline(ctx, time.Now().Add(10*time.Second))
+		execution.Shutdown(shutdownCtx)
+		cancelShutdown()
+
+	case <-execution.Done():
+		log.Infof("the order execution is completed")
+
+	case <-ctx.Done():
 	}
 }
 
@@ -142,7 +199,7 @@ func (s *Strategy) getQuantities(balances types.BalanceMap) (quantities types.Fl
 	return quantities
 }
 
-func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice) (submitOrders []types.SubmitOrder) {
+func (s *Strategy) generateTargetOrders(prices, marketValues types.Float64Slice) (targetOrders []TargetOrder) {
 	currentWeights := marketValues.Normalize()
 	totalValue := marketValues.Sum()
 
@@ -158,7 +215,7 @@ func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice)
 		currentPrice := prices[i]
 		targetWeight := s.TargetWeights[currency].Float64()
 
-		log.Infof("%s price: %v, current weight: %v, target weight: %v",
+		log.Infof("%s price: %.2f, current weight: %.2f, target weight: %.2f",
 			symbol,
 			currentPrice,
 			currentWeight,
@@ -168,12 +225,12 @@ func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice)
 		// if the difference is less than threshold, then we will not create the order
 		weightDifference := targetWeight - currentWeight
 		if math.Abs(weightDifference) < s.Threshold.Float64() {
-			log.Infof("%s weight distance |%v - %v| = |%v| less than the threshold: %v",
+			log.Infof("%s weight distance |%.2f - %.2f| = |%.2f| less than the threshold: %.2f",
 				symbol,
 				currentWeight,
 				targetWeight,
 				weightDifference,
-				s.Threshold)
+				s.Threshold.Float64())
 			continue
 		}
 
@@ -185,25 +242,16 @@ func (s *Strategy) generateSubmitOrders(prices, marketValues types.Float64Slice)
 			quantity = quantity.Abs()
 		}
 
-		if s.MaxAmount.Sign() > 0 {
-			quantity = bbgo.AdjustQuantityByMaxAmount(quantity, fixedpoint.NewFromFloat(currentPrice), s.MaxAmount)
-			log.Infof("adjust the quantity %v (%s %s @ %v) by max amount %v",
-				quantity,
-				symbol,
-				side.String(),
-				currentPrice,
-				s.MaxAmount)
-		}
 		log.Debugf("symbol: %v, quantity: %v", symbol, quantity)
-		order := types.SubmitOrder{
+
+		targetOrder := TargetOrder{
 			Symbol:   symbol,
 			Side:     side,
-			Type:     types.OrderTypeMarket,
-			Quantity: quantity}
-
-		submitOrders = append(submitOrders, order)
+			Quantity: quantity,
+		}
+		targetOrders = append(targetOrders, targetOrder)
 	}
-	return submitOrders
+	return targetOrders
 }
 
 func (s *Strategy) getSymbols() (symbols []string) {
