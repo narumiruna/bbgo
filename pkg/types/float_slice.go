@@ -8,6 +8,14 @@ import (
 
 type Float64Slice []float64
 
+func NewOneFloats(n int) Float64Slice {
+	o := make(Float64Slice, n)
+	for i := 0; i < n; i++ {
+		o[i] = 1.0
+	}
+	return o
+}
+
 func (s *Float64Slice) Push(v float64) {
 	*s = append(*s, v)
 }
@@ -79,6 +87,13 @@ func (s Float64Slice) NegativeValuesOrZero() (values Float64Slice) {
 func (s Float64Slice) Abs() (values Float64Slice) {
 	for _, v := range s {
 		values.Push(math.Abs(v))
+	}
+	return values
+}
+
+func (s Float64Slice) Pow(exponent float64) (values Float64Slice) {
+	for _, v := range s {
+		values.Push(math.Pow(v, exponent))
 	}
 	return values
 }
