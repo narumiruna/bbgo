@@ -40,7 +40,7 @@ require (
 	github.com/pquerna/otp v1.3.0
 	github.com/prometheus/client_golang v1.11.1
 	github.com/rifflock/lfshook v0.0.0-20180920164130-b9218ef580f5
-	github.com/robfig/cron/v3 v3.0.0
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/sajari/regression v1.0.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/slack-go/slack v0.10.1
